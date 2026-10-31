@@ -145,6 +145,36 @@ hopfield = StorkeyHopfield(
 Edge(source=source_node, target=hopfield.slot("in"))
 ```
 
+### HopfieldMemoryNode
+
+`HopfieldMemoryNode` uses the modern HopfieldPC retrieval core to recall from a
+frozen prototype bank. Unlike `StorkeyHopfield`, it performs
+query-to-memory retrieval directly; its prototype vectors are not included in
+FabricPC's trainable graph parameters.
+
+```python
+from fabricpc.nodes import HopfieldMemoryNode
+
+memory = HopfieldMemoryNode(
+    shape=(128,),
+    name="memory",
+    prototypes=prototypes,
+    beta=1.0,
+    num_updates=2,
+    normalize=True,
+    center=center,
+)
+
+Edge(source=source_node, target=memory.slot("in"))
+```
+
+Pass a `[num_memories, dim]` array of fixed prototypes; `center` is an optional
+mean vector subtracted from the query and prototypes before retrieval and
+restored to the result. The input and output shapes must match the prototype
+dimension. Multi-dimensional shapes are flattened for retrieval and restored
+afterward. The node defaults to normalized similarity scoring; increase `beta`
+for sharper memory selection.
+
 ### SkipConnection
 
 A passthrough merge node for residual architectures with no learnable parameters. It sums inputs from two slots and passes the sum through:
