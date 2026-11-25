@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from fabricpc.hopfield import (
+    attention_entropy,
     hopfield_energy,
     hopfield_retrieve,
     multi_step_retrieve,
@@ -329,6 +330,91 @@ def test_multistep_requires_static_configuration():
         jax.jit(multi_step_retrieve)(query, memory, num_updates=2)
     with pytest.raises(TypeError, match="return_states.*static"):
         jax.jit(multi_step_retrieve)(query, memory, return_states=True)
+
+
+def test_attention_entropy_matches_known_distributions():
+    weights = jnp.asarray([[1.0, 0.0], [0.9, 0.1], [0.5, 0.5]], jnp.float64)
+    skewed_entropy = -0.9 * math.log(0.9) - 0.1 * math.log(0.1)
+    expected = np.array([0.0, skewed_entropy, math.log(2.0)])
+    np.testing.assert_allclose(attention_entropy(weights), expected, atol=1e-12)
+    np.testing.assert_allclose(
+        attention_entropy(weights, normalize=True), expected / math.log(2.0), atol=1e-12
+    )
+
+
+def test_attention_entropy_ignores_inactive_slots_and_uses_active_count():
+    weights = jnp.asarray([[0.5, np.nan, 0.5, np.inf]], jnp.float64)
+    mask = jnp.asarray([True, False, True, False])
+    masked_entropy = attention_entropy(weights, active_mask=mask)
+    np.testing.assert_allclose(masked_entropy, [math.log(2.0)], atol=1e-12)
+    np.testing.assert_allclose(
+        attention_entropy(weights, active_mask=mask, normalize=True), [1.0], atol=1e-12
+    )
+    single = jnp.asarray([[np.nan, 1.0, np.inf]], jnp.float64)
+    single_mask = jnp.asarray([False, True, False])
+    np.testing.assert_array_equal(
+        attention_entropy(single, active_mask=single_mask, normalize=True), [0.0]
+    )
+
+
+def test_attention_entropy_gradient_is_masked_and_finite_at_zero():
+    weights = jnp.asarray([[0.75, np.nan, 0.25, 0.0]], jnp.float64)
+    mask = jnp.asarray([True, False, True, True])
+    gradient = jax.grad(lambda w: attention_entropy(w, active_mask=mask).sum())(weights)
+    expected = [-math.log(0.75) - 1.0, -math.log(0.25) - 1.0]
+    np.testing.assert_allclose(gradient[:, [0, 2]], [expected], atol=1e-12)
+    np.testing.assert_array_equal(gradient[:, 1], 0.0)
+    assert np.isfinite(gradient[0, 3])
+
+
+def test_compiled_attention_entropy_tracks_multistep_retrieval_concentration():
+    query = jnp.asarray([[1.0], [0.0]], jnp.float64)
+    memory = jnp.asarray([[-1.0], [np.nan], [1.0]], jnp.float64)
+    mask = jnp.asarray([True, False, True])
+
+    def retrieval_entropy(q, m, active, *, beta):
+        _, weights = multi_step_retrieve(
+            q, m, beta=beta, num_updates=2, active_mask=active
+        )
+        return attention_entropy(weights, active_mask=active, normalize=True)
+
+    compiled = jax.jit(retrieval_entropy, static_argnames=("beta",))
+    broad = compiled(query, memory, mask, beta=0.25)
+    concentrated = compiled(query, memory, mask, beta=6.0)
+    assert 0.0 <= concentrated[0] < broad[0] <= 1.0
+    np.testing.assert_allclose([broad[1], concentrated[1]], [1.0, 1.0], atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_dtype"),
+    [
+        (jnp.float16, jnp.float32),
+        (jnp.bfloat16, jnp.float32),
+        (jnp.float32, jnp.float32),
+        (jnp.float64, jnp.float64),
+    ],
+)
+def test_attention_entropy_uses_working_precision(dtype, expected_dtype):
+    weights = jnp.asarray([[0.5, 0.5]], dtype)
+    entropy = attention_entropy(weights)
+    assert entropy.dtype == expected_dtype
+    np.testing.assert_allclose(entropy, [math.log(2.0)], rtol=1e-7)
+
+
+def test_attention_entropy_rejects_invalid_static_inputs():
+    weights = jnp.asarray([[0.5, 0.5]], jnp.float64)
+    with pytest.raises(ValueError, match="weights.*shape"):
+        attention_entropy(weights[0])
+    with pytest.raises(ValueError, match="weights.*shape"):
+        attention_entropy(weights[:, :0])
+    with pytest.raises(ValueError, match="active_mask.*shape"):
+        attention_entropy(weights, active_mask=jnp.asarray([True]))
+    with pytest.raises(TypeError, match="active_mask.*boolean"):
+        attention_entropy(weights, active_mask=jnp.asarray([1, 1]))
+    with pytest.raises(TypeError, match="Inputs must use float"):
+        attention_entropy(weights.astype(jnp.int32))
+    with pytest.raises(TypeError, match="normalize.*static"):
+        jax.jit(attention_entropy)(weights, normalize=True)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
