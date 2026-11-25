@@ -66,7 +66,7 @@ from tqdm.auto import tqdm as _tqdm_cls
 from fabricpc.core.energy import graph_energy
 from fabricpc.core.inference import run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
-from fabricpc.core.types import GraphParams, GraphState, GraphStructure
+from fabricpc.core.types import GraphParams, GraphState, GraphStructure, NodeBuffers
 from fabricpc.graph_initialization.state_initializer import (
     FeedforwardStateInit,
     initialize_graph_state,
@@ -388,7 +388,7 @@ def pc_weight_gradients(
     return jax.tree_util.tree_map(lambda g: g / denom, grads)
 
 
-def _batch_grads(params, batch, structure, rng_key, *, algorithm):
+def _batch_grads(params, batch, structure, rng_key, *, algorithm, node_buffers):
     """Gradients and metrics for one batch — the only algorithm branch."""
     batch_size = batch_size_of(batch, structure)
     clamps = build_clamps(batch, structure, clamp_target=True)
@@ -398,7 +398,12 @@ def _batch_grads(params, batch, structure, rng_key, *, algorithm):
 
     if algorithm == "pc":
         state = initialize_graph_state(
-            structure, batch_size, rng_key, clamps=clamps, params=params
+            structure,
+            batch_size,
+            rng_key,
+            clamps=clamps,
+            params=params,
+            node_buffers=node_buffers,
         )
         state = run_inference(params, state, clamps, structure)
         energy = graph_energy(state, structure) / denom
@@ -412,7 +417,12 @@ def _batch_grads(params, batch, structure, rng_key, *, algorithm):
 
         def objective(p):
             state = initialize_graph_state(
-                structure, batch_size, rng_key, clamps=clamps, params=p
+                structure,
+                batch_size,
+                rng_key,
+                clamps=clamps,
+                params=p,
+                node_buffers=node_buffers,
             )
             return (
                 graph_energy(state, structure, node_names=target_nodes) / denom,
@@ -445,9 +455,14 @@ def _make_step(structure, optimizer, *, algorithm, with_state, donate):
     params+opt_state copy from peak memory.
     """
 
-    def step(params, opt_state, batch, rng_key):
+    def step(params, opt_state, batch, rng_key, *, node_buffers=None):
         grads, metrics, state = _batch_grads(
-            params, batch, structure, rng_key, algorithm=algorithm
+            params,
+            batch,
+            structure,
+            rng_key,
+            algorithm=algorithm,
+            node_buffers=node_buffers,
         )
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = cast(GraphParams, optax.apply_updates(params, updates))
@@ -467,15 +482,18 @@ def make_train_step(
 ):
     """Build a jitted training step for custom loops.
 
-    Returns ``step(params, opt_state, batch, rng_key) -> (params, opt_state,
-    metrics, final_state)``. ``metrics`` is a dict of device scalars
+    Returns ``step(params, opt_state, batch, rng_key, *, node_buffers=None)``
+    with outputs ``(params, opt_state, metrics, final_state)``.
+    ``node_buffers`` supplies non-trainable runtime arrays keyed by node name
+    to graph state initialization. Pass prevalidated Hopfield banks here.
+    ``metrics`` is a dict of device scalars
     (``"energy"``: the objective per prediction; ``"target_energy"``:
     target-node energy per prediction). ``final_state`` is the settled (PC) or
     feedforward (backprop) GraphState — the escape hatch for dashboards.
     Inputs are NOT donated: callers may reuse the initial params.
 
-    With ``mesh``, params/opt_state are placed replicated and each batch is
-    sharded on its leading axis over the ``"data"`` mesh axis.
+    With ``mesh``, params, opt_state, and node buffers are replicated. Each
+    batch is sharded on its leading axis over the ``"data"`` mesh axis.
     """
     _validate_algorithm(algorithm, structure)
     jitted = _make_step(
@@ -488,11 +506,12 @@ def make_train_step(
     batch_sharding = NamedSharding(mesh, P("data"))
     replicated = NamedSharding(mesh, P())
 
-    def step(params, opt_state, batch, rng_key):
+    def step(params, opt_state, batch, rng_key, *, node_buffers=None):
         params = jax.device_put(params, replicated)
         opt_state = jax.device_put(opt_state, replicated)
         batch = {k: jax.device_put(v, batch_sharding) for k, v in batch.items()}
-        return jitted(params, opt_state, batch, rng_key)
+        node_buffers = jax.device_put(node_buffers, replicated)
+        return jitted(params, opt_state, batch, rng_key, node_buffers=node_buffers)
 
     return step
 
@@ -517,6 +536,7 @@ def train(
     verbose: bool = True,
     epoch_callback: Optional[Callable[[EpochContext], Any]] = None,
     iter_callback: Optional[Callable[[IterContext], Any]] = None,
+    node_buffers: Optional[Dict[str, NodeBuffers]] = None,
 ) -> TrainResult:
     """Train a FabricPC graph with PC or backprop.
 
@@ -557,6 +577,8 @@ def train(
             forces a per-batch device sync and makes the internal step
             return the batch's GraphState for ``ctx.state``. Exceptions
             propagate.
+        node_buffers: Non-trainable runtime arrays keyed by node name,
+            shared across batches in this call and replicated under ``mesh``.
 
     Returns:
         :class:`TrainResult` — pass ``result.opt_state`` and
@@ -581,6 +603,7 @@ def train(
         replicated = NamedSharding(mesh, P())
         params = jax.device_put(params, replicated)
         opt_state = jax.device_put(opt_state, replicated)
+        node_buffers = jax.device_put(node_buffers, replicated)
 
     # The step returns the batch's GraphState only when a callback will read
     # it; without one the state is dropped inside the step.
@@ -652,11 +675,11 @@ def train(
             batch_key = jax.random.fold_in(epoch_key, batch_idx)
             if with_state:
                 params, opt_state, metrics, state = step_fn(
-                    params, opt_state, batch, batch_key
+                    params, opt_state, batch, batch_key, node_buffers=node_buffers
                 )
             else:
                 params, opt_state, metrics = step_fn(
-                    params, opt_state, batch, batch_key
+                    params, opt_state, batch, batch_key, node_buffers=node_buffers
                 )
                 state = None
             step += 1
@@ -763,6 +786,7 @@ def evaluate(
     algorithm: Algorithm = "pc",
     mesh: Optional[Mesh] = None,
     metrics: Optional[Dict[str, Any]] = None,
+    node_buffers: Optional[Dict[str, NodeBuffers]] = None,
 ) -> Dict[str, float]:
     """Evaluate a FabricPC graph: inputs clamped, targets free.
 
@@ -776,6 +800,9 @@ def evaluate(
     ``perplexity`` when the target functional is ``CrossEntropyEnergy``,
     ``energy`` for PC. The defaults raise ``ValueError`` on a graph with no
     target task key; a caller-supplied dict carries no such requirement.
+
+    ``node_buffers`` supplies the same non-trainable runtime arrays to each
+    batch by node name. These arrays are replicated under ``mesh``.
 
     Aggregation is weighted: each metric's per-sample ``(value, weight)``
     pairs accumulate across batches (and devices, under ``mesh``) and the
@@ -793,11 +820,16 @@ def evaluate(
         metric_map = {name: as_eval_metric(m) for name, m in metrics.items()}
     metric_names = tuple(metric_map)
 
-    def eval_step(p, batch, key, sample_mask):
+    def eval_step(p, batch, key, sample_mask, node_buffers):
         batch_size = batch_size_of(batch, structure)
         clamps = build_clamps(batch, structure, clamp_target=False)
         state = initialize_graph_state(
-            structure, batch_size, key, clamps=clamps, params=p
+            structure,
+            batch_size,
+            key,
+            clamps=clamps,
+            params=p,
+            node_buffers=node_buffers,
         )
         if algorithm == "pc":
             state = run_inference(p, state, clamps, structure)
@@ -819,7 +851,9 @@ def evaluate(
         data_axis_size = _data_axis_size(mesh)
         batch_sharding = NamedSharding(mesh, P("data"))
         mask_sharding = NamedSharding(mesh, P("data"))
-        params = jax.device_put(params, NamedSharding(mesh, P()))
+        replicated = NamedSharding(mesh, P())
+        params = jax.device_put(params, replicated)
+        node_buffers = jax.device_put(node_buffers, replicated)
 
     totals = {name: (jnp.zeros(()), jnp.zeros(())) for name in metric_names}
     for batch_idx, batch_data in enumerate(test_loader):
@@ -839,7 +873,7 @@ def evaluate(
             batch = {k: jax.device_put(v, batch_sharding) for k, v in batch.items()}
             sample_mask = jax.device_put(sample_mask, mask_sharding)
         key = jax.random.fold_in(rng_key, batch_idx)
-        out = jit_eval(params, batch, key, sample_mask)
+        out = jit_eval(params, batch, key, sample_mask, node_buffers)
         totals = {
             name: (totals[name][0] + out[name][0], totals[name][1] + out[name][1])
             for name in metric_names
