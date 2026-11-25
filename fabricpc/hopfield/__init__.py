@@ -1,6 +1,7 @@
-"""Standalone JAX functions for modern Hopfield retrieval."""
+"""Standalone JAX functions for modern Hopfield retrieval and energy."""
 
 from ._validation import validate_hopfield_inputs
+from .energy import hopfield_energy
 from .functional import hopfield_retrieve
 
-__all__ = ["hopfield_retrieve", "validate_hopfield_inputs"]
+__all__ = ["hopfield_energy", "hopfield_retrieve", "validate_hopfield_inputs"]

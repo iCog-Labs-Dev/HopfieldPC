@@ -12,11 +12,14 @@ import jax.numpy as jnp
 from ._validation import prepare_inputs, validate_beta
 
 
+def _similarities(query: jax.Array, memory: jax.Array) -> jax.Array:
+    return jnp.matmul(query, memory.T, precision=jax.lax.Precision.HIGHEST)
+
+
 def _centered_scores(
-    query: jax.Array, memory: jax.Array, mask: jax.Array, beta: float
+    similarities: jax.Array, mask: jax.Array, beta: float
 ) -> tuple[jax.Array, jax.Array]:
     """Subtract the maximum active similarity BEFORE inverse-temperature scaling."""
-    similarities = jnp.matmul(query, memory.T, precision=jax.lax.Precision.HIGHEST)
     maximum = jax.lax.stop_gradient(
         jnp.max(jnp.where(mask[None, :], similarities, -jnp.inf), axis=-1)
     )
@@ -27,7 +30,7 @@ def _centered_scores(
 def _retrieve_prepared(
     query: jax.Array, memory: jax.Array, mask: jax.Array, beta: float
 ) -> tuple[jax.Array, jax.Array]:
-    scores, _ = _centered_scores(query, memory, mask, beta)
+    scores, _ = _centered_scores(_similarities(query, memory), mask, beta)
     weights = jax.nn.softmax(scores, axis=-1)
     retrieved = jnp.matmul(weights, memory, precision=jax.lax.Precision.HIGHEST)
     return retrieved, weights
