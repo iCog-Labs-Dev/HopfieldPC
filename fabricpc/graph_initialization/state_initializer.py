@@ -31,6 +31,7 @@ from fabricpc.core.types import (
     GraphState,
     GraphStructure,
     GraphParams,
+    NodeBuffers,
     NodeState,
 )
 from fabricpc.core.state_ops import set_latents_to_clamps
@@ -54,7 +55,8 @@ class StateInitBase(ABC):
                 super().__init__(fill_value=fill_value)
 
             @staticmethod
-            def initialize_state(structure, batch_size, rng_key, clamps, config, params=None):
+            def initialize_state(structure, batch_size, rng_key, clamps, config,
+                                 params=None, *, node_buffers=None):
                 ...
 
     All computation methods are static for JAX compatibility (pure functions, no state).
@@ -72,6 +74,8 @@ class StateInitBase(ABC):
         clamps: Dict[str, jnp.ndarray],
         config: Dict[str, Any],
         params: GraphParams = None,
+        *,
+        node_buffers: Dict[str, NodeBuffers] | None = None,
     ) -> GraphState:
         """
         Initialize graph state for inference. Apply data clamps to latent states if provided.
@@ -83,6 +87,8 @@ class StateInitBase(ABC):
             clamps: Dictionary of clamped values, keyed on node names
             config: State initialization configuration (from instance .config)
             params: GraphParams (may be required for some strategies)
+            node_buffers: Runtime arrays keyed by node name. Attach them to
+                the corresponding states before any node forward pass.
 
         Returns:
             Initialized GraphState
@@ -117,6 +123,8 @@ class GlobalStateInit(StateInitBase):
         clamps: Dict[str, jnp.ndarray],
         config: Dict[str, Any],
         params: GraphParams = None,
+        *,
+        node_buffers: Dict[str, NodeBuffers] | None = None,
     ) -> GraphState:
         """Initialize states from a distribution."""
         global_init_config = config.get("initializer", None)
@@ -127,6 +135,7 @@ class GlobalStateInit(StateInitBase):
         rng_keys = jax.random.split(rng_key, len(node_names))
         rng_key_map = dict(zip(node_names, rng_keys))
 
+        node_buffers = node_buffers or {}
         node_state_dict = {}
 
         for node_name, node in structure.nodes.items():
@@ -151,6 +160,7 @@ class GlobalStateInit(StateInitBase):
                 error=jnp.zeros(shape),
                 energy=jnp.zeros((batch_size,)),
                 latent_grad=jnp.zeros(shape),
+                buffers=node_buffers.get(node_name),
             )
 
         state = GraphState(nodes=node_state_dict, batch_size=batch_size)
@@ -175,12 +185,15 @@ class NodeDistributionStateInit(StateInitBase):
         clamps: Dict[str, jnp.ndarray],
         config: Dict[str, Any],
         params: GraphParams = None,
+        *,
+        node_buffers: Dict[str, NodeBuffers] | None = None,
     ) -> GraphState:
         """Initialize states from a distribution."""
         node_names = list(structure.nodes.keys())
         rng_keys = jax.random.split(rng_key, len(node_names))
         rng_key_map = dict(zip(node_names, rng_keys))
 
+        node_buffers = node_buffers or {}
         node_state_dict = {}
 
         for node_name, node in structure.nodes.items():
@@ -201,6 +214,7 @@ class NodeDistributionStateInit(StateInitBase):
                 error=jnp.zeros(shape),
                 energy=jnp.zeros((batch_size,)),
                 latent_grad=jnp.zeros(shape),
+                buffers=node_buffers.get(node_name),
             )
 
         state = GraphState(nodes=node_state_dict, batch_size=batch_size)
@@ -240,6 +254,8 @@ class FeedforwardStateInit(StateInitBase):
         clamps: Dict[str, jnp.ndarray],
         config: Dict[str, Any],
         params: GraphParams = None,
+        *,
+        node_buffers: Dict[str, NodeBuffers] | None = None,
     ) -> GraphState:
         """Initialize states via feedforward propagation."""
         if params is None:
@@ -249,6 +265,7 @@ class FeedforwardStateInit(StateInitBase):
         rng_keys = jax.random.split(rng_key, len(node_names))
         rng_key_map = dict(zip(node_names, rng_keys))
 
+        node_buffers = node_buffers or {}
         # First pass: initialize all nodes with their default initializer (used as
         # fallback for graph cycles). Clamps are overlaid afterwards.
         node_state_dict = {}
@@ -270,6 +287,7 @@ class FeedforwardStateInit(StateInitBase):
                 error=jnp.zeros(shape),
                 energy=jnp.zeros((batch_size,)),
                 latent_grad=jnp.zeros(shape),
+                buffers=node_buffers.get(node_name),
             )
 
         state = GraphState(nodes=node_state_dict, batch_size=batch_size)
@@ -366,6 +384,8 @@ def initialize_graph_state(
     clamps: Dict[str, jnp.ndarray] = None,
     state_init: StateInitBase = None,
     params: GraphParams = None,
+    *,
+    node_buffers: Dict[str, NodeBuffers] | None = None,
 ) -> GraphState:
     """
     Initialize graph state using the specified strategy.
@@ -377,6 +397,10 @@ def initialize_graph_state(
         clamps: Dictionary of clamped values
         state_init: StateInitBase instance (default: from structure config)
         params: GraphParams (required for feedforward init)
+        node_buffers: Non-trainable runtime arrays keyed by node name. Custom
+            initializers can accept this keyword to attach buffers before
+            their first forward pass. The keyword is passed only when supplied
+            with entries.
 
     Returns:
         Initialized GraphState
@@ -394,9 +418,22 @@ def initialize_graph_state(
     if state_init is None:
         state_init = structure.config["graph_state_initializer"]
 
-    state = type(state_init).initialize_state(
-        structure, batch_size, rng_key, clamps, state_init.config, params
-    )
+    initialize = type(state_init).initialize_state
+    args = (structure, batch_size, rng_key, clamps, state_init.config, params)
+    if node_buffers:
+        unknown_nodes = node_buffers.keys() - structure.nodes.keys()
+        if unknown_nodes:
+            raise ValueError(
+                f"node_buffers contains unknown nodes: {sorted(unknown_nodes)}."
+            )
+        state = initialize(
+            *args,
+            node_buffers={
+                name: dict(buffers) for name, buffers in node_buffers.items()
+            },
+        )
+    else:
+        state = initialize(*args)
 
     # Shared post-pass: in_degree == 0 nodes have no in-edges to project a
     # z_mu, so initialization assigns it — z_mu <- z_latent, cast to z_mu's

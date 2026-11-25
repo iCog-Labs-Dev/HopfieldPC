@@ -80,6 +80,41 @@ def prepare_inputs(
     return query_work, memory_work, mask
 
 
+def _validate_active_bank(memory_work: jax.Array, mask: jax.Array) -> None:
+    """Check concrete bank values after inactive rows have been neutralized."""
+    if not np.asarray(mask).any():
+        raise ValueError("active_mask must contain at least one active memory.")
+    if not np.isfinite(np.asarray(memory_work)).all():
+        raise ValueError("Active memory values must be finite.")
+
+
+def prepare_hopfield_bank(
+    memory: jax.Array, *, active_mask: jax.Array | None = None
+) -> dict[str, jax.Array]:
+    """Validate a concrete bank and return its node buffers.
+
+    Pass the result as the entry for the receiving node in
+    ``initialize_graph_state(..., node_buffers=...)``. The returned buffers
+    are ``hopfield_memory`` with shape ``[N, D]`` and
+    ``hopfield_active_mask`` with shape ``[N]``. Omitting the mask activates
+    all rows. The bank keeps its values and dtype, including inactive storage.
+
+    This check may synchronize device arrays. Run it outside JAX transforms
+    before supplying the buffers as runtime inputs to a compiled episode.
+    """
+    memory = jnp.asarray(memory)
+    if memory.ndim != 2 or any(size == 0 for size in memory.shape):
+        raise ValueError("memory must have shape [N, D] with N and D positive.")
+    dtype = working_dtype(memory.dtype)
+    mask = prepare_mask(active_mask, memory.shape[0])
+    if any(isinstance(value, jax.core.Tracer) for value in (memory, mask)):
+        raise TypeError("prepare_hopfield_bank must run outside JAX transformations.")
+
+    memory_work = jnp.where(mask[:, None], memory, 0).astype(dtype)
+    _validate_active_bank(memory_work, mask)
+    return {"hopfield_memory": memory, "hopfield_active_mask": mask}
+
+
 def validate_hopfield_inputs(
     query: jax.Array,
     memory: jax.Array,
@@ -103,9 +138,6 @@ def validate_hopfield_inputs(
         raise TypeError(
             "validate_hopfield_inputs must run outside JAX transformations."
         )
-    if not np.asarray(mask).any():
-        raise ValueError("active_mask must contain at least one active memory.")
+    _validate_active_bank(memory_work, mask)
     if not np.isfinite(np.asarray(query_work)).all():
         raise ValueError("query must contain only finite values.")
-    if not np.isfinite(np.asarray(memory_work)).all():
-        raise ValueError("Active memory values must be finite.")
