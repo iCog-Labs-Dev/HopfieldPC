@@ -10,6 +10,7 @@ import pytest
 from fabricpc.hopfield import (
     hopfield_energy,
     hopfield_retrieve,
+    multi_step_retrieve,
     validate_hopfield_inputs,
 )
 
@@ -215,6 +216,119 @@ def test_compiled_and_vmapped_core_matches_eager_results():
     for want, jit_value, vmap_value in zip(expected, compiled, vmapped):
         np.testing.assert_allclose(jit_value, want, atol=1e-12, rtol=1e-12)
         np.testing.assert_allclose(vmap_value, want, atol=1e-12, rtol=1e-12)
+
+
+def test_multistep_default_matches_one_step():
+    query, memory = example()
+    expected_state, expected_weights = hopfield_retrieve(query, memory, beta=2.0)
+    state, weights = multi_step_retrieve(query, memory, beta=2.0)
+    np.testing.assert_allclose(state, expected_state, atol=1e-12)
+    np.testing.assert_allclose(weights, expected_weights, atol=1e-12)
+    _, _, states = multi_step_retrieve(query, memory, beta=2.0, return_states=True)
+    assert len(states) == 2
+    np.testing.assert_array_equal(states[0], query)
+    np.testing.assert_allclose(states[1], state, atol=1e-12)
+
+
+def test_multistep_trajectory_and_final_weights_match_independent_reference():
+    query, memory = example()
+    beta = 2.0
+    final, weights, states = multi_step_retrieve(
+        query, memory, beta=beta, num_updates=3, return_states=True
+    )
+    assert isinstance(states, list)
+    assert len(states) == 4
+    np.testing.assert_array_equal(states[0], query)
+
+    reference = query
+    for state in states[1:]:
+        reference, reference_weights, _ = numpy_reference(reference, memory, beta)
+        np.testing.assert_allclose(state, reference, atol=1e-12, rtol=1e-12)
+    np.testing.assert_allclose(final, reference, atol=1e-12, rtol=1e-12)
+    np.testing.assert_allclose(weights, reference_weights, atol=1e-12, rtol=1e-12)
+    _, next_weights, _ = numpy_reference(final, memory, beta)
+    assert not np.allclose(weights, next_weights, atol=1e-5, rtol=1e-5)
+
+    final_only, weights_only = multi_step_retrieve(
+        query, memory, beta=beta, num_updates=3
+    )
+    np.testing.assert_allclose(final_only, final, atol=1e-12)
+    np.testing.assert_allclose(weights_only, weights, atol=1e-12)
+
+
+def test_compiled_multistep_matches_compact_active_bank():
+    query, active_memory = example()
+    inactive = jnp.asarray([[np.nan, np.inf]], dtype=active_memory.dtype)
+    memory = jnp.concatenate((active_memory, inactive))
+    mask = jnp.asarray([True, True, True, False])
+    compiled = jax.jit(
+        multi_step_retrieve, static_argnames=("beta", "num_updates", "return_states")
+    )
+    final, weights, states = compiled(
+        query, memory, beta=1.5, num_updates=3, active_mask=mask, return_states=True
+    )
+    expected_final, expected_weights, expected_states = multi_step_retrieve(
+        query, active_memory, beta=1.5, num_updates=3, return_states=True
+    )
+    np.testing.assert_allclose(final, expected_final, atol=1e-12)
+    np.testing.assert_allclose(weights[:, mask], expected_weights, atol=1e-12)
+    np.testing.assert_array_equal(weights[:, ~mask], 0.0)
+    np.testing.assert_allclose(states, expected_states, atol=1e-12)
+
+
+@pytest.mark.parametrize("return_states", [False, True])
+def test_multistep_gradients_match_unrolled_retrieval(return_states):
+    query, memory = example()
+    mask = jnp.asarray([True, False, True])
+
+    def with_scan(q, m):
+        state = multi_step_retrieve(
+            q, m, beta=2.0, num_updates=3, active_mask=mask, return_states=return_states
+        )[0]
+        return state.sum()
+
+    def unrolled(q, m):
+        for _ in range(3):
+            q, _ = hopfield_retrieve(q, m, beta=2.0, active_mask=mask)
+        return q.sum()
+
+    actual = jax.jit(jax.grad(with_scan, argnums=(0, 1)))(query, memory)
+    expected = jax.grad(unrolled, argnums=(0, 1))(query, memory)
+    for gradient, expected_gradient in zip(actual, expected):
+        np.testing.assert_allclose(gradient, expected_gradient, atol=1e-12, rtol=1e-12)
+    np.testing.assert_array_equal(actual[1][~mask], 0.0)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
+def test_multistep_retains_float32_for_all_returned_states(dtype):
+    query = jnp.asarray([[0.8, 0.5]], dtype)
+    memory = jnp.asarray([[1.0, 0.0], [0.0, 1.0]], dtype)
+    options = dict(beta=2.0, num_updates=3, return_states=True)
+    final, weights, states = multi_step_retrieve(query, memory, **options)
+    expected = multi_step_retrieve(
+        query.astype(jnp.float32), memory.astype(jnp.float32), **options
+    )
+    for actual, reference in zip(
+        jax.tree_util.tree_leaves((final, weights, states)),
+        jax.tree_util.tree_leaves(expected),
+    ):
+        assert actual.dtype == jnp.float32
+        np.testing.assert_array_equal(actual, reference)
+
+
+@pytest.mark.parametrize("num_updates", [True, 0, -1, 1.5])
+def test_multistep_requires_a_positive_integer_update_count(num_updates):
+    query, memory = example()
+    with pytest.raises(ValueError, match="num_updates"):
+        multi_step_retrieve(query, memory, num_updates=num_updates)
+
+
+def test_multistep_requires_static_configuration():
+    query, memory = example()
+    with pytest.raises(ValueError, match="num_updates.*static"):
+        jax.jit(multi_step_retrieve)(query, memory, num_updates=2)
+    with pytest.raises(TypeError, match="return_states.*static"):
+        jax.jit(multi_step_retrieve)(query, memory, return_states=True)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
