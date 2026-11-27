@@ -27,6 +27,7 @@ from fabricpc.nodes.transformer_v2 import (
     VocabProjectionNode,
 )
 from fabricpc.nodes.storkey_hopfield import StorkeyHopfield
+from fabricpc.nodes.hopfield_linear import HopfieldLinear
 from fabricpc.nodes.skip_connection import SkipConnection
 from fabricpc.nodes.linear_residual import LinearResidual
 from fabricpc.nodes.convolutional import ConvNode
@@ -53,6 +54,7 @@ __all__ = [
     "Mlp2ResidualNode",
     "VocabProjectionNode",
     "StorkeyHopfield",
+    "HopfieldLinear",
     "SkipConnection",
     "LinearResidual",
 ]

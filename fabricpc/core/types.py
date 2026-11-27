@@ -108,6 +108,9 @@ class GraphParams(NamedTuple):
         return f"GraphParams(nodes={n_nodes}, total_params={total_params})"
 
 
+NodeBuffers = Dict[str, jnp.ndarray]
+
+
 class NodeState(NamedTuple):
     """
     Dynamic state of the Node during inference.
@@ -123,6 +126,9 @@ class NodeState(NamedTuple):
             state-based solvers the one-hop accumulated dE/dz_latent; under
             ``EPCInference`` the gradient of the total energy w.r.t. ε
             through the full derived forward
+        buffers: Optional named runtime arrays carried through inference,
+            such as a fixed memory bank and mask shared across the batch.
+            These arrays are outside ``GraphParams``.
     """
 
     z_latent: jnp.ndarray
@@ -130,6 +136,7 @@ class NodeState(NamedTuple):
     error: jnp.ndarray
     energy: jnp.ndarray  # per-sample energy, shape (batch_size,)
     latent_grad: jnp.ndarray  # accumulator: sPC dE/dz_latent, ePC dE/depsilon
+    buffers: Optional[NodeBuffers] = None
 
 
 class GraphState(NamedTuple):
@@ -202,6 +209,7 @@ tree_util.register_pytree_node(
             ns.error,
             ns.energy,
             ns.latent_grad,
+            ns.buffers,
         ),
         None,
     ),
@@ -211,7 +219,7 @@ tree_util.register_pytree_node(
 tree_util.register_pytree_node(
     GraphState,
     lambda gs: (
-        (gs.nodes,),  # Dynamic children (differentiable)
+        (gs.nodes,),  # Dynamic children
         (gs.batch_size,),  # Static auxiliary data (metadata)
     ),
     lambda aux, children: GraphState(children[0], aux[0]),
